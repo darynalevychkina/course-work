@@ -21,7 +21,6 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 from loguru import logger
-import aiohttp
 import holidays
 
 from utils_shared import now_local, main_menu, is_admin, normalize_date
@@ -31,32 +30,11 @@ from google_calendar import (
     list_visible_calendars as gcal_list_visible,
     get_service_account_email,
 )
-
-try:
-    from google_calendar import create_event_for_order as gcal_create_event_for_order
-
-    HAS_CREATE_FOR_ORDER = True
-except Exception:
-    gcal_create_event_for_order = None
-    HAS_CREATE_FOR_ORDER = False
-
-try:
-    from google_calendar import create_event as gcal_create_event_basic
-except Exception:
-    gcal_create_event_basic = None
-
-try:
-    from google_calendar import ensure_order_id as gcal_ensure_order_id
-
-    HAS_ENSURE_ORDER = True
-except Exception:
-    HAS_ENSURE_ORDER = False
-    gcal_ensure_order_id = None
-
 from admin import r_admin, init_admin_context
 from payments import r_pay, init_pay_context, set_receipts_dir
 from receipts_store import ensure_receipts_dir
 from plate_api import fetch_plate_info, plate_format_ok, normalize_plate
+from vin_api import normalize_vin, validate_vin, fetch_vehicle_by_vin
 
 load_dotenv()
 
@@ -73,14 +51,13 @@ RECEIPTS_DIR = os.getenv("RECEIPTS_DIR", "./receipts")
 ensure_receipts_dir(RECEIPTS_DIR)
 
 BAZAGAI_API_KEY = os.getenv("BAZAGAI_API_KEY", "")
-BAZAGAI_MOCK = os.getenv("BAZAGAI_MOCK", "0") == "1" or not BAZAGAI_API_KEY
 BAZAGAI_TIMEOUT = int(os.getenv("BAZAGAI_TIMEOUT", "10"))
-logger.info(f"BazaGAI: mock={BAZAGAI_MOCK} timeout={BAZAGAI_TIMEOUT}s")
+logger.info(f"BazaGAI timeout={BAZAGAI_TIMEOUT}s, api_key_present={bool(BAZAGAI_API_KEY)}")
 
 if not BOT_TOKEN:
     raise RuntimeError("Немає BOT_TOKEN у .env")
 if not AUTO_DEV_API_KEY:
-    raise RuntimeError("Немає AUTO_DEV_API_KEY у .env (Auto.dev обов'язковий)")
+    logger.warning("AUTO_DEV_API_KEY не заданий. VIN буде працювати в mock-режимі.")
 
 logger.info(f"TIMEZONE in use: {TIMEZONE}")
 logger.info(f"Receipts dir: {os.path.abspath(RECEIPTS_DIR)}")
@@ -149,6 +126,27 @@ UA_HOLIDAYS_CACHE: dict[int, holidays.HolidayBase] = {}
 gcal_service = None
 gcal_enabled = False
 
+try:
+    from google_calendar import create_event_for_order as gcal_create_event_for_order
+
+    HAS_CREATE_FOR_ORDER = True
+except Exception:
+    gcal_create_event_for_order = None
+    HAS_CREATE_FOR_ORDER = False
+
+try:
+    from google_calendar import create_event as gcal_create_event_basic
+except Exception:
+    gcal_create_event_basic = None
+
+try:
+    from google_calendar import ensure_order_id as gcal_ensure_order_id
+
+    HAS_ENSURE_ORDER = True
+except Exception:
+    HAS_ENSURE_ORDER = False
+    gcal_ensure_order_id = None
+
 
 class RegStates(StatesGroup):
     full_name = State()
@@ -213,152 +211,15 @@ def time_inline_kb(date_key: str):
 def reasons_inline_kb():
     b = InlineKeyboardBuilder()
     b.row(
-        InlineKeyboardButton(
-            text=REASONS["oil"], callback_data="reason:oil"
-        ),
-        InlineKeyboardButton(
-            text=REASONS["diag"], callback_data="reason:diag"
-        ),
+        InlineKeyboardButton(text=REASONS["oil"], callback_data="reason:oil"),
+        InlineKeyboardButton(text=REASONS["diag"], callback_data="reason:diag"),
     )
     b.row(
-        InlineKeyboardButton(
-            text=REASONS["tires"], callback_data="reason:tires"
-        ),
-        InlineKeyboardButton(
-            text=REASONS["other"], callback_data="reason:other"
-        ),
+        InlineKeyboardButton(text=REASONS["tires"], callback_data="reason:tires"),
+        InlineKeyboardButton(text=REASONS["other"], callback_data="reason:other"),
     )
     b.row(InlineKeyboardButton(text="Назад", callback_data="reason_back"))
     return b.as_markup()
-
-
-_TRANSLIT = {
-    **{str(i): i for i in range(10)},
-    "A": 1,
-    "B": 2,
-    "C": 3,
-    "D": 4,
-    "E": 5,
-    "F": 6,
-    "G": 7,
-    "H": 8,
-    "J": 1,
-    "K": 2,
-    "L": 3,
-    "M": 4,
-    "N": 5,
-    "P": 7,
-    "R": 9,
-    "S": 2,
-    "T": 3,
-    "U": 4,
-    "V": 5,
-    "W": 6,
-    "X": 7,
-    "Y": 8,
-    "Z": 9,
-}
-_WEIGHTS = [8, 7, 6, 5, 4, 3, 2, 10, 0, 9, 8, 7, 6, 5, 4, 3, 2]
-
-
-def vin_checksum_ok(vin: str) -> bool:
-    vin = vin.upper()
-    total = 0
-    for i, ch in enumerate(vin):
-        if ch not in _TRANSLIT:
-            return False
-        total += _TRANSLIT[ch] * _WEIGHTS[i]
-    check = total % 11
-    expected = "X" if check == 10 else str(check)
-    return vin[8] == expected
-
-
-AUTODEV_URL = "https://api.auto.dev/vin/{vin}"
-VPIC_URL = (
-    "https://vpic.nhtsa.dot.gov/api/vehicles/DecodeVinValues/{vin}"
-    "?format=json&modelyear={year}"
-)
-
-
-def _extract_vehicle_from_autodev(payload: dict) -> dict:
-    if not payload:
-        return {}
-    make = payload.get("make") or payload.get("manufacturer")
-    model = payload.get("model")
-    year = payload.get("year")
-    data = payload.get("data") or payload.get("vehicle") or payload.get("specs") or {}
-    make = make or data.get("make") or data.get("manufacturer")
-    model = model or data.get("model")
-    year = (
-        year
-        or data.get("year")
-        or data.get("model_year")
-        or data.get("year_of_manufacture")
-    )
-    results = payload.get("results") or payload.get("Result") or []
-    if isinstance(results, list) and results:
-        r0 = results[0]
-        make = make or r0.get("make") or r0.get("manufacturer")
-        model = model or r0.get("model")
-        year = year or r0.get("year") or r0.get("model_year")
-    out = {}
-    if make:
-        out["make"] = make
-    if model:
-        out["model"] = model
-    if year:
-        out["year"] = year
-    return out
-
-
-async def decode_vin_autodev(vin: str) -> dict | None:
-    headers = {"x-api-key": AUTO_DEV_API_KEY}
-    timeout = aiohttp.ClientTimeout(total=12)
-    async with aiohttp.ClientSession(timeout=timeout) as s:
-        async with s.get(AUTODEV_URL.format(vin=vin), headers=headers) as r:
-            if r.status == 200:
-                raw = await r.json()
-                vehicle = _extract_vehicle_from_autodev(raw)
-                return {"raw": raw, "vehicle": vehicle}
-            logger.warning(f"Auto.dev HTTP {r.status}")
-            return None
-
-
-async def decode_vin_vpic(vin: str) -> tuple[bool, str]:
-    timeout = aiohttp.ClientTimeout(total=10)
-    year_candidates = [now_local(TIMEZONE).year, now_local(TIMEZONE).year - 1]
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as s:
-            for y in year_candidates:
-                async with s.get(VPIC_URL.format(vin=vin), year=y) as resp:  # type: ignore
-                    data = await resp.json()
-                    row = (data.get("Results") or [{}])[0]
-                    code = str(row.get("ErrorCode", "")).strip()
-                    text = row.get("ErrorText", "") or ""
-                    if code.startswith(("0", "7", "8")):
-                        return True, text or "vPIC OK"
-        return False, "vPIC: VIN не підтверджено"
-    except Exception as e:
-        logger.warning(f"vPIC error: {e}")
-        return True, "vPIC недоступний"
-
-
-async def verify_vin(vin: str) -> tuple[bool, str, dict | None]:
-    if not re.fullmatch(r"^[A-HJ-NPR-Z0-9]{17}$", vin, flags=re.IGNORECASE):
-        return False, "Формат VIN має бути 17 символів (без I/O/Q).", None
-    if not vin_checksum_ok(vin):
-        return False, "Контрольна цифра VIN не сходиться (ISO-3779).", None
-    extra = None
-    try:
-        extra = await decode_vin_autodev(vin)
-        if extra:
-            return True, "VIN підтверджено (Auto.dev).", extra
-    except Exception as e:
-        logger.warning(f"Auto.dev error: {e}")
-    ok, msg = await decode_vin_vpic(vin)
-    if ok:
-        return True, f"VIN підтверджено ({msg}).", None
-    return False, "Не вдалося підтвердити VIN. Перевір правильність або спробуй інший.", None
 
 
 r = Router()
@@ -381,9 +242,7 @@ async def start_reg(m: Message, state: FSMContext):
     if m.from_user.id in USERS:
         await m.answer(
             "Ти вже зареєстрований ✅",
-            reply_markup=main_menu(
-                True, is_admin(m.from_user.id, ADMIN_IDS)
-            ),
+            reply_markup=main_menu(True, is_admin(m.from_user.id, ADMIN_IDS)),
         )
         return
     await state.set_state(RegStates.full_name)
@@ -443,12 +302,8 @@ async def reg_phone(m: Message, state: FSMContext):
 
     kb = InlineKeyboardBuilder()
     kb.row(
-        InlineKeyboardButton(
-            text="🔑 За VIN", callback_data="reg:via_vin"
-        ),
-        InlineKeyboardButton(
-            text="🔤 За номером авто", callback_data="reg:via_plate"
-        ),
+        InlineKeyboardButton(text="🔑 За VIN", callback_data="reg:via_vin"),
+        InlineKeyboardButton(text="🔤 За номером авто", callback_data="reg:via_plate"),
     )
     await m.answer(
         "Оберіть спосіб реєстрації автомобіля:",
@@ -459,9 +314,7 @@ async def reg_phone(m: Message, state: FSMContext):
 @r.callback_query(F.data == "reg:via_vin")
 async def reg_choose_vin(cq: CallbackQuery, state: FSMContext):
     await state.set_state(RegStates.vin)
-    await cq.message.edit_text(
-        "Введи VIN (17 символів, латиниця/цифри, без I/O/Q):"
-    )
+    await cq.message.edit_text("Введи VIN (17 символів, латиниця/цифри, без I/O/Q):")
     await cq.answer()
 
 
@@ -477,21 +330,64 @@ async def reg_choose_plate(cq: CallbackQuery, state: FSMContext):
 
 @r.message(RegStates.vin, F.text)
 async def reg_vin(m: Message, state: FSMContext):
-    vin = (m.text or "").strip().upper()
-    if vin == "Скасувати":
+    raw_vin = (m.text or "").strip()
+    if raw_vin == "Скасувати":
         await cancel_any(m, state)
         return
-    ok, info, extra = await verify_vin(vin)
-    if not ok:
-        await m.answer(f"❌ {info}")
+
+    vin = normalize_vin(raw_vin)
+    if not validate_vin(vin):
+        await m.answer("❌ VIN-код некоректний. Перевір, будь ласка, ще раз.")
         return
 
-    vehicle = (extra or {}).get("vehicle") if extra else {}
-    make = (vehicle or {}).get("make") or "—"
-    model = (vehicle or {}).get("model") or "—"
-    year = (vehicle or {}).get("year") or "—"
+    extra = await fetch_vehicle_by_vin(vin)
 
-    await state.update_data(vin=vin, vehicle_guess=vehicle or {})
+    vehicle_data: dict = {}
+    if isinstance(extra, dict):
+        if isinstance(extra.get("vehicle"), dict):
+            vehicle_data = extra["vehicle"]
+        else:
+            vehicle_data = extra
+
+    make = (
+        vehicle_data.get("make")
+        or vehicle_data.get("manufacturer")
+        or "—"
+    )
+    model = vehicle_data.get("model") or ""
+    year = (
+        vehicle_data.get("year")
+        or vehicle_data.get("model_year")
+        or vehicle_data.get("year_of_manufacture")
+        or "—"
+    )
+
+    vehicle = {"make": make, "model": model or None, "year": year}
+    await state.update_data(vin=vin, vehicle_guess=vehicle)
+
+    title_parts: list[str] = []
+    if make and make != "—":
+        title_parts.append(make)
+    if model:
+        title_parts.append(model)
+
+    if title_parts:
+        title = " ".join(title_parts)
+    else:
+        title = vin
+
+    if year and year != "—":
+        found_line = f"{title}, {year}"
+    else:
+        found_line = title
+
+    if extra is None:
+        main_text = (
+            "VIN підтверджено.\n"
+            "Марку/модель автоматично не знайшов, але VIN валідний."
+        )
+    else:
+        main_text = f"VIN підтверджено.\nЗнайшов авто: {found_line}"
 
     kb = InlineKeyboardBuilder()
     kb.row(
@@ -502,14 +398,12 @@ async def reg_vin(m: Message, state: FSMContext):
             text="❌ Ні, ввести інший VIN", callback_data="vin:confirm_no"
         ),
     )
+
     await m.answer(
-        "VIN підтверджено.\n"
-        f"Знайшов авто: {make} {model}, {year}\n\n"
-        "Підтверджуєш?",
+        main_text + "\n\nПідтверджуєш?",
         reply_markup=kb.as_markup(),
     )
     await state.set_state(RegByVinConfirm.confirm)
-
 
 @r.callback_query(RegByVinConfirm.confirm, F.data == "vin:confirm_yes")
 async def reg_vin_confirm_yes(cq: CallbackQuery, state: FSMContext):
@@ -525,9 +419,7 @@ async def reg_vin_confirm_yes(cq: CallbackQuery, state: FSMContext):
     await cq.message.edit_text("Реєстрацію завершено ✅")
     await cq.message.answer(
         "Тепер натисни «Зробити запис».",
-        reply_markup=main_menu(
-            True, is_admin(cq.from_user.id, ADMIN_IDS)
-        ),
+        reply_markup=main_menu(True, is_admin(cq.from_user.id, ADMIN_IDS)),
     )
     await cq.answer()
 
@@ -552,7 +444,7 @@ async def reg_plate_enter(m: Message, state: FSMContext):
     info = None
     try:
         info = await fetch_plate_info(
-            plate, BAZAGAI_API_KEY, mock=BAZAGAI_MOCK, timeout_sec=BAZAGAI_TIMEOUT
+            plate, BAZAGAI_API_KEY, timeout_sec=BAZAGAI_TIMEOUT
         )
     except Exception as e:
         logger.error(f"Baza-GAI fetch error: {e}")
@@ -577,12 +469,8 @@ async def reg_plate_enter(m: Message, state: FSMContext):
     warn = "⚠️ В базі позначено як можливе викрадення!\n" if stolen else ""
     kb = InlineKeyboardBuilder()
     kb.row(
-        InlineKeyboardButton(
-            text="✅ Так, це моє авто", callback_data="plate:confirm_yes"
-        ),
-        InlineKeyboardButton(
-            text="❌ Ні, не моє", callback_data="plate:confirm_no"
-        ),
+        InlineKeyboardButton(text="✅ Так, це моє авто", callback_data="plate:confirm_yes"),
+        InlineKeyboardButton(text="❌ Ні, не моє", callback_data="plate:confirm_no"),
     )
     await m.answer(
         f"{warn}Знайшов авто:\n"
@@ -608,9 +496,7 @@ async def reg_plate_confirm_yes(cq: CallbackQuery, state: FSMContext):
     await cq.message.edit_text("Реєстрацію завершено ✅")
     await cq.message.answer(
         "Тепер натисни «Зробити запис».",
-        reply_markup=main_menu(
-            True, is_admin(cq.from_user.id, ADMIN_IDS)
-        ),
+        reply_markup=main_menu(True, is_admin(cq.from_user.id, ADMIN_IDS)),
     )
     await cq.answer()
 
@@ -619,18 +505,12 @@ async def reg_plate_confirm_yes(cq: CallbackQuery, state: FSMContext):
 async def reg_plate_confirm_no(cq: CallbackQuery, state: FSMContext):
     kb = InlineKeyboardBuilder()
     kb.row(
-        InlineKeyboardButton(
-            text="🔁 Ввести інший номер", callback_data="reg:via_plate"
-        )
+        InlineKeyboardButton(text="🔁 Ввести інший номер", callback_data="reg:via_plate")
     )
     kb.row(
-        InlineKeyboardButton(
-            text="🔑 Реєстрація за VIN", callback_data="reg:via_vin"
-        )
+        InlineKeyboardButton(text="🔑 Реєстрація за VIN", callback_data="reg:via_vin")
     )
-    await cq.message.edit_text(
-        "Окей. Обери інший спосіб:", reply_markup=kb.as_markup()
-    )
+    await cq.message.edit_text("Окей. Обери інший спосіб:", reply_markup=kb.as_markup())
     await cq.answer()
 
 
@@ -639,9 +519,7 @@ async def cancel_any(m: Message, state: FSMContext):
     await state.clear()
     await m.answer(
         "Дію скасовано. Повертаю в головне меню.",
-        reply_markup=main_menu(
-            m.from_user.id in USERS, is_admin(m.from_user.id, ADMIN_IDS)
-        ),
+        reply_markup=main_menu(m.from_user.id in USERS, is_admin(m.from_user.id, ADMIN_IDS)),
     )
 
 
@@ -671,9 +549,7 @@ async def get_date(m: Message, state: FSMContext):
         )
         return
 
-    dt = datetime.strptime(date_key, "%d.%m.%Y").replace(
-        tzinfo=ZoneInfo(TIMEZONE)
-    )
+    dt = datetime.strptime(date_key, "%d.%m.%Y").replace(tzinfo=ZoneInfo(TIMEZONE))
     now = now_local(TIMEZONE)
 
     if dt.date() < now.date():
@@ -801,9 +677,7 @@ async def pick_reason(cq: CallbackQuery, state: FSMContext):
     )
     await cq.message.answer(
         "Повертаю в головне меню.",
-        reply_markup=main_menu(
-            True, is_admin(cq.from_user.id, ADMIN_IDS)
-        ),
+        reply_markup=main_menu(True, is_admin(cq.from_user.id, ADMIN_IDS)),
     )
     await cq.answer()
 
@@ -812,9 +686,7 @@ async def pick_reason(cq: CallbackQuery, state: FSMContext):
 async def reason_other_text(m: Message, state: FSMContext):
     reason = " ".join(m.text.split())
     if len(reason) < 3:
-        await m.answer(
-            "Дуже коротко. Опиши трохи детальніше (від 3 символів)."
-        )
+        await m.answer("Дуже коротко. Опиши трохи детальніше (від 3 символів).")
         return
     data = await state.get_data()
     date_key: str = data.get("date_key")
@@ -841,9 +713,7 @@ async def reason_other_text(m: Message, state: FSMContext):
     )
     await m.answer(
         "Повертаю в головне меню.",
-        reply_markup=main_menu(
-            True, is_admin(m.from_user.id, ADMIN_IDS)
-        ),
+        reply_markup=main_menu(True, is_admin(m.from_user.id, ADMIN_IDS)),
     )
 
 
@@ -863,9 +733,7 @@ def _is_closed_day(dt: datetime) -> bool:
 
 
 def _gen_order_id(date_key: str, time_str: str, user_id: int) -> str:
-    dt = datetime.strptime(
-        f"{date_key} {time_str}", "%d.%m.%Y %H:%M"
-    )
+    dt = datetime.strptime(f"{date_key} {time_str}", "%d.%m.%Y %H:%M")
     return f"{dt.strftime('%Y%m%d-%H%M')}-{user_id}"
 
 
@@ -885,9 +753,7 @@ async def finalize_booking(
         return False
 
     if start_dt <= now_local(TIMEZONE):
-        logger.info(
-            f"finalize_booking: past slot rejected → {date_key} {time_str}"
-        )
+        logger.info(f"finalize_booking: past slot rejected → {date_key} {time_str}")
         return False
 
     if _is_closed_day(start_dt):
@@ -896,9 +762,7 @@ async def finalize_booking(
 
     taken = BOOKED.setdefault(date_key, set())
     if time_str in taken:
-        logger.info(
-            f"finalize_booking: already taken → {date_key} {time_str}"
-        )
+        logger.info(f"finalize_booking: already taken → {date_key} {time_str}")
         return False
 
     taken.add(time_str)
@@ -922,11 +786,7 @@ async def finalize_booking(
             veh = user.get("vehicle") or {}
             car = (
                 ", ".join(
-                    [
-                        str(veh.get(k))
-                        for k in ("make", "model", "year")
-                        if veh.get(k)
-                    ]
+                    [str(veh.get(k)) for k in ("make", "model", "year") if veh.get(k)]
                 )
                 if veh
                 else ""
@@ -965,11 +825,7 @@ async def finalize_booking(
                     summary,
                     description,
                 )
-                if (
-                    HAS_ENSURE_ORDER
-                    and gcal_ensure_order_id
-                    and event_id
-                ):
+                if HAS_ENSURE_ORDER and gcal_ensure_order_id and event_id:
                     await asyncio.to_thread(
                         gcal_ensure_order_id,
                         gcal_service,
@@ -982,17 +838,13 @@ async def finalize_booking(
 
             if event_id:
                 rec["gcal_event_id"] = event_id
-                logger.info(
-                    f"Google Calendar: подію створено ({event_id})"
-                )
+                logger.info(f"Google Calendar: подію створено ({event_id})")
             else:
                 logger.warning(
                     "Google Calendar: не вдалося створити подію (нема відповідної функції)."
                 )
         except Exception as e:
-            logger.error(
-                f"Google Calendar: не вдалося створити подію: {e}"
-            )
+            logger.error(f"Google Calendar: не вдалося створити подію: {e}")
 
     logger.info(
         f"BOOKED: {date_key} {time_str} by {user_id} — {reason} (order_id={order_id})"
@@ -1023,9 +875,7 @@ async def main():
             )
             logger.info(f"Service Account email: {sa_email}")
 
-            visible = await asyncio.to_thread(
-                gcal_list_visible, gcal_service
-            )
+            visible = await asyncio.to_thread(gcal_list_visible, gcal_service)
             if visible:
                 logger.info("Calendars visible to service account:")
                 for c in visible:
@@ -1048,9 +898,7 @@ async def main():
         except Exception as e:
             gcal_service = None
             gcal_enabled = False
-            logger.error(
-                f"Google Calendar: помилка ініціалізації — {e}"
-            )
+            logger.error(f"Google Calendar: помилка ініціалізації — {e}")
 
     init_admin_context(
         users=USERS,
