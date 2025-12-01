@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+
+.env
+*.json
+
+sto-bot-475907-ba4ac71e8238.json
+
+receipts/
+
+.vscode/
+.idea/
